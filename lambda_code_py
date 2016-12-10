@@ -1,0 +1,608 @@
+
+
+import boto3
+import json
+import logging
+import os
+import urllib
+import re
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+from base64 import b64decode
+from urlparse import parse_qs
+#from .infodict import InfoDict
+
+from six.moves import urllib
+
+import time
+
+
+
+#from libbgg.apibase import BGGBase
+
+#from libbgg.errors import InvalidInputError
+
+from datetime import date
+
+import six
+
+
+
+#This section borrowed from https://github.com/crustymonkey/py-bgg/blob/master/libbgg
+
+
+class InfoDict(dict):
+
+    """
+
+    Subclassing dict to add a classmethod which builds a dict from xml
+
+    """
+
+    # Take advantage of compilation for performance
+
+    strip_NS_re = re.compile('^\{?[^\}]*\}')
+
+
+
+    def __getattr__(self, name):
+
+        """
+
+        Add attribute access as an option
+
+        """
+
+        return self[name]
+
+
+
+    @classmethod
+
+    def xml_to_info_dict(cls, xml, strip_NS=True):
+
+        """
+
+        Return an InfoDict which contains the xml tree
+
+
+
+        xml:str         The xml string to convert
+
+        stripNS:bool    If True, the namespace prefix will be stripped
+
+                        from the tags (keys) default: True
+
+        """
+
+        d = cls()
+
+        root = ET.fromstring(xml.strip())
+
+        d._build_dict_from_xml(d, root, strip_NS)
+
+        return d
+
+
+
+    def _build_dict_from_xml(self, d, el, strip_NS):
+
+        """
+
+        Recursively construct an InfoDict from an ElementTree object
+
+
+
+        d:InfoDict      An empty instance of ourself to start and
+
+                        subsequent instances as we recurse through
+
+                        the tree
+
+        el:xml.etree.ElementTree.Element    The current element in the tree
+
+        stripNS:bool    If this is True, the namespace will be stripped from
+
+                        tags
+
+        """
+
+        children = el.getchildren()
+
+        if strip_NS:
+
+            tag = self._strip_NS(el.tag)
+
+        new_dict = InfoDict(el.attrib)
+
+        if tag in d:
+
+            if not isinstance(d[tag], list):
+
+                # Handle multiple entries at the same level
+
+                val = d[tag]
+
+                d[tag] = [val]
+
+        else:
+
+            # Instantiate this otherwise
+
+            d[tag] = None
+
+        if children:
+
+            # We have children
+
+            if isinstance(d[tag], list):
+
+                d[tag].append(new_dict)
+
+            else:
+
+                d[tag] = new_dict
+
+            for c in children:
+
+                self._build_dict_from_xml(new_dict, c, strip_NS)
+
+        else:
+
+            # handle multiple tags with the same name by creating and 
+
+            # appending to a list
+
+            if el.text:
+
+                new_dict['TEXT'] = el.text
+
+            if isinstance(d[tag], list):
+
+                #d[tag].append(el.text)
+
+                d[tag].append(new_dict)
+
+            else:
+
+                # By defaul, the value will be a string
+
+                d[tag] = new_dict
+
+
+
+    def _strip_NS(self, tag):
+
+        """
+
+        Strips off the namespace tag prefix
+
+        """
+
+        return self.strip_NS_re.sub('', tag)   
+        
+        
+        
+        
+class BGGBase(object):
+
+    def __init__(self, url_base='http://www.boardgamegeek.com', 
+
+            path_base=''):
+
+        """
+
+        Set up the basic url stuff for retrieving items via the api
+
+        
+
+        url_base:str        The base url, including the http:// portion
+
+        path_base:str       The base portion of the uri
+
+        """
+
+        self.url_base = url_base.rstrip('/')
+
+        self.path_base = path_base.strip('/')
+
+        self._base = '%s/%s' % (self.url_base, self.path_base)
+
+        self._base = self._base.rstrip('/')
+
+        self._opener = self._get_opener()
+
+
+
+    def _get_opener(self):
+
+        """
+
+        This returns a basic opener.  If auth is ever needed, this is the
+
+        place it would be implemented
+
+        """
+
+        o = urllib.request.build_opener()
+
+        return o
+
+    
+
+    def call(self, call_type, call_dict, wait=False):
+
+        """
+
+        This handles all of the actual calls to the bgg api.  It takes the
+
+        first portion of the url and appends it to the base, then builds
+
+        the query string from the call_dict after filtering None values.
+
+
+
+        call_type:str       The path addition to append to the base url
+
+        call_dict:dict      This is a dictionary mapping to be turned into
+
+                            a query string
+
+        wait:bool           This will cause the api to retry if a 202 is
+
+                            returned until a 200 is returned.  This is
+
+                            needed for the async calls for get_collection()
+
+
+
+        returns InfoDict    Returns a mapping of items from the native XML
+
+                            to a dictionary mapping
+
+        """
+
+        # First, filter any None values from the list
+
+        for key, val in list(call_dict.items()):
+
+            if val is None:
+
+                del call_dict[key]
+
+
+
+        url = '%s/%s?%s' % (self._base, urllib.parse.quote(call_type), 
+
+            urllib.parse.urlencode(call_dict))
+
+        res = self._opener.open(url)
+
+        resp_str = res.read()
+
+        if wait and res.code == 202:
+
+            time.sleep(1)
+
+            return self.call(call_type, call_dict, wait)
+
+        return InfoDict.xml_to_info_dict(resp_str)
+class InvalidInputError(Exception):
+
+    pass
+
+
+
+class APICallError(Exception):
+
+    pass
+
+
+
+class BGG(BGGBase):
+
+    def __init__(self, url_base='http://www.boardgamegeek.com', 
+
+            path_base='xmlapi'):
+
+        super(BGG, self).__init__(url_base, path_base)
+
+
+
+    def search(self, search_str, exact=False):
+
+        """
+
+        Search for board games by string.  If exact is true, only exact
+
+        matches will be returned
+
+        
+
+        search_str:str          The string to search for
+
+        exact:bool              Match the string exactly
+
+        """
+
+        d = { 'search': search_str, 'exact': int(exact) }
+
+        return self.call('search', d)
+
+
+
+    def get_game(self, game_ids=None, comments=False, comments_page=1,
+
+            stats=False, historical=False, historical_start=None, 
+
+            historical_end=None):
+
+        """
+
+        Gets info on a particular game or games.  game_ids can be either
+
+        an integer id, a string id ("12345"), or an iterable of ids.
+
+
+
+        game_ids:(str|int|list[int|str])    The id or ids to get info for
+
+        comments:bool       Get user comments.  Can be paginated with
+
+                            comments_page
+
+        comments_page:int   The page of comments to retrieve
+
+        stats:bool          Retrieve game stats
+
+        historical:bool     Include historical game stats
+
+        historical_start:datetime.date      The start date for historical stats
+
+        historical_end:datetime.date        The end date for historical stats
+
+        """
+
+        if isinstance(game_ids, (six.string_types, int)):
+
+            game_ids = [ int(game_ids) ]
+
+        else:
+
+            game_ids = [ int(gid) for gid in game_ids ]
+
+        d = { 'stats': int(stats) }
+
+        if comments:
+
+            # Set the comments options
+
+            d['comments'] = 1
+
+            d['comments_page'] = comments_page
+
+        if historical:
+
+            # Set the historical options
+
+            d['historical'] = 1
+
+            if isinstance(historical_start, date):
+
+                d['from'] = str(historical_start)
+
+            elif historical_start is not None:
+
+                raise InvalidInputError('"historical_start" must be of type '
+
+                    'datetime.date, not %s' % type(historical_start))
+
+            if isinstance(historical_end, date):
+
+                d['to'] = str(historical_end)
+
+            elif historical_end is not None:
+
+                raise InvalidInputError('"historical_end" must be of type '
+
+                    'datetime.date, not %s' % type(historical_end))
+
+        return self.call('boardgame/%s' % ','.join(
+
+            [ str(gid) for gid in game_ids ]), d)
+
+
+
+    def get_collection(self, username, wait=True, **kwargs):
+
+        """
+
+        This will retrieve a user's collection, with optional flags set.
+
+        There are just too many options here to have individual options
+
+        listed here.  You can specify any of the options in your call
+
+        like so: 
+
+        
+
+        obj.get_collection('username', own=1, played=1)
+
+
+
+        All the options are listed on the documentation page for the API
+
+        at http://boardgamegeek.com/wiki/page/BGG_XML_API#toc4
+
+
+
+        username:str        The username to retrieve the collection for
+
+        wait:bool           Wait for the collection to be loaded before
+
+                            returning from this function.  If false, it
+
+                            will return immediately with whatever
+
+                            response was received.
+
+        kwargs              See the API options for the various opts
+
+        """
+
+        # All the option values in the kwargs should have integer values
+
+        # so set them as such
+
+        for key, val in list(kwargs.items()):
+
+            kwargs[key] = int(val)
+
+        return self.call('collection/%s' % username, kwargs, wait)
+
+
+
+    def get_thread_messages(self, thr_id, start=0, count=100, 
+
+            username=None):
+
+        """
+
+        Gets messages from a forum/game thread.
+
+
+
+        thr_id:int          The thread id
+
+        start:int           The start article, increment this for pagination
+
+        count:int           Number of messages to return, the default and
+
+                            max are 100
+
+        username:str        The username to filter for
+
+        """
+
+        thr_id = int(thr_id)
+
+        d = { 'start': int(start), 'count': int(count) }
+
+        if d['count'] > 100:
+
+            raise InvalidInputError('The maximum value for "count" is 100, and '
+
+                'you requested %s' % count)
+
+        if username is not None:
+
+            d['username'] = username
+
+        return self.call('thread/%s' % thr_id, d)
+
+
+
+    def get_geeklist(self, list_id, comments=False):
+
+        """
+
+        Gets the geeklist given the specified id.
+
+
+
+        list_id:int         The geeklist id
+
+        comments:bool       If set to True, will also retrieve the comments
+
+        """
+
+        list_id = int(list_id)
+
+        d = { 'comments': int(comments) }
+
+        return self.call('geeklist/%s' % list_id, d)
+####################################End borrowed section
+
+
+        
+        
+
+
+
+ENCRYPTED_EXPECTED_TOKEN = os.environ['kmsEncryptedToken']
+
+kms = boto3.client('kms')
+expected_token = kms.decrypt(CiphertextBlob=b64decode(ENCRYPTED_EXPECTED_TOKEN))['Plaintext']
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+slackWebhookUrl = 'https://hooks.slack.com/services/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'
+
+def respond(err, res=None):
+    return {
+        'statusCode': '400' if err else '200',
+        'body': err.message if err else json.dumps(res),
+        'headers': {
+            'Content-Type': 'application/json',
+        },
+    }
+
+
+def lambda_handler(event, context):
+    params = parse_qs(event['body'])
+    token = params['token'][0]
+    if token != expected_token:
+        logger.error("Request token (%s) does not match expected", token)
+        return respond(Exception('Invalid request token'))
+
+    user = params['user_name'][0]
+    if params['text'][0] == "help":
+        helpMessage =   "search -> returns link to bgg page,   whats -> returns designer name,  when -> when the game was released, kind -> returns the type of game"
+        return helpMessage
+        
+    command = params['text'][0].split(' ', 1)[0]
+    usrInput =  params['text'][0].split(' ', 1)[1]
+    channel = params['channel_name'][0]
+    command_text = params['text'][0]
+    bggURL = "http://www.boardgamegeek.com/boardgame/"
+    getVars = {'search' : usrInput}
+    conn = BGG()
+    gameInfo = conn.search(usrInput, True)
+    returnMessage = ""
+    if command == "search":
+       boardGameID = gameInfo['boardgames']['boardgame']['objectid']
+       returnMessage = bggURL +  boardGameID
+    elif command == "whats":
+        boardGameInfo = conn.get_game(gameInfo['boardgames']['boardgame']['objectid'])
+        boardGameDescription = boardGameInfo['boardgames']['boardgame']['description']['TEXT']
+        returnMessage = boardGameDescription
+    elif command == "designer":
+        boardGameInfo = conn.get_game(gameInfo['boardgames']['boardgame']['objectid'])
+        boardGameDescription = boardGameInfo['boardgames']['boardgame']['boardgamedesigner']['TEXT']
+        returnMessage = boardGameDescription
+    elif command == "when":
+        boardGameInfo = conn.get_game(gameInfo['boardgames']['boardgame']['objectid'])
+        boardGameDescription = boardGameInfo['boardgames']['boardgame']['yearpublished']['TEXT']
+        returnMessage = boardGameDescription
+    elif command == "kind":
+        boardGameInfo = conn.get_game(gameInfo['boardgames']['boardgame']['objectid'])
+        boardGameDescription = boardGameInfo['boardgames']['boardgame']['boardgamecategory']
+        if len(boardGameDescription) < 3:
+            returnMessage = boardGameDescription['TEXT']
+        else:
+            for value in boardGameDescription:
+                newString =  str(value['TEXT'])
+                returnMessage +=  "%s, "% newString
+
+       # returnMessage = ",".join(boardGameDescription['TEXT'])
+    
+    elif command == "all":
+         boardGameInfo = conn.get_game(gameInfo['boardgames']['boardgame']['objectid'])
+         boardGameDescription = boardGameInfo
+         returnMessage = boardGameDescription
+    else:
+        returnMessage = "I don't know that command."
+    
+    return returnMessage
+    
